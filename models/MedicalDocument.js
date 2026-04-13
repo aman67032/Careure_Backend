@@ -14,8 +14,13 @@ const medicalDocumentSchema = new mongoose.Schema({
     type: String,
     trim: true
   },
-  file_path: {
-    type: String
+  file_data: {
+    type: Buffer,
+    required: true
+  },
+  content_type: {
+    type: String,
+    required: true
   },
   uploaded_by: {
     type: mongoose.Schema.Types.ObjectId,

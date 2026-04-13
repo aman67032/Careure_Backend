@@ -7,16 +7,8 @@ const path = require('path');
 const router = express.Router();
 
 // Configure multer for file uploads
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    const uploadsDir = process.env.VERCEL || process.env.VERCEL_ENV ? '/tmp/uploads/' : 'uploads/';
-    cb(null, uploadsDir);
-  },
-  filename: (req, file, cb) => {
-    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
-    cb(null, uniqueSuffix + path.extname(file.originalname));
-  }
-});
+// Configure multer for file uploads
+const storage = multer.memoryStorage();
 
 const upload = multer({ 
   storage: storage,
@@ -50,6 +42,7 @@ router.get('/patient/:patientId', authenticateToken, async (req, res) => {
     }
 
     const documents = await MedicalDocument.find({ patient_id: patientId })
+      .select('-file_data')
       .sort({ created_at: -1 });
 
     res.json({ documents: documents.map(d => { const obj = d.toObject(); obj.id = obj._id; return obj; }) });
@@ -83,12 +76,14 @@ router.post('/patient/:patientId/upload', authenticateToken, upload.single('docu
       patient_id: patientId,
       document_type: document_type,
       file_name: req.file.originalname,
-      file_path: req.file.path,
+      file_data: req.file.buffer,
+      content_type: req.file.mimetype,
       uploaded_by: req.user.id
     });
 
     const docObj = document.toObject();
     docObj.id = docObj._id;
+    delete docObj.file_data;
 
     res.status(201).json({
       message: 'Document uploaded successfully',
@@ -120,18 +115,32 @@ router.delete('/:id', authenticateToken, async (req, res) => {
       return res.status(404).json({ error: 'Document not found' });
     }
 
-    const fs = require('fs');
-    
-    // Delete file from filesystem
-    if (document.file_path && fs.existsSync(document.file_path)) {
-      fs.unlinkSync(document.file_path);
-    }
+    // File is deleted when the document is deleted from MongoDB
 
     await MedicalDocument.findByIdAndDelete(id);
 
     res.json({ message: 'Document deleted successfully' });
   } catch (error) {
     console.error('Delete document error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+// Download document
+router.get('/:id/download', async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    // Find document
+    const document = await MedicalDocument.findById(id);
+    if (!document) {
+      return res.status(404).json({ error: 'Document not found' });
+    }
+
+    res.set('Content-Type', document.content_type);
+    res.set('Content-Disposition', `inline; filename="${document.file_name}"`);
+    res.send(document.file_data);
+  } catch (error) {
+    console.error('Download document error:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
