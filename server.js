@@ -64,6 +64,16 @@ try {
   console.warn('Could not create uploads directory:', err.message);
 }
 
+// Ensure database is connected before handling routes (Important for Serverless mapping)
+app.use(async (req, res, next) => {
+  try {
+    await initDatabase();
+    next();
+  } catch (err) {
+    next(err);
+  }
+});
+
 // Routes
 app.use('/api/auth', require('./routes/auth'));
 app.use('/api/patients', require('./routes/patients'));
