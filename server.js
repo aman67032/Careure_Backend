@@ -13,7 +13,6 @@ const PORT = process.env.PORT || 5000;
 // CORS configuration - allow multiple origins
 const allowedOrigins = [
   'http://localhost:3000',
-  'https://care-sure-frontend-ebm.vercel.app',
   process.env.FRONTEND_URL
 ].filter(Boolean); // Remove undefined values
 
@@ -55,9 +54,14 @@ app.use(express.urlencoded({ extended: true }));
 
 // Create uploads directory if it doesn't exist
 const fs = require('fs');
-const uploadsDir = './uploads';
-if (!fs.existsSync(uploadsDir)) {
-  fs.mkdirSync(uploadsDir, { recursive: true });
+// Vercel serverless functions only have write access to /tmp
+const uploadsDir = process.env.VERCEL || process.env.VERCEL_ENV ? '/tmp/uploads' : './uploads';
+try {
+  if (!fs.existsSync(uploadsDir)) {
+    fs.mkdirSync(uploadsDir, { recursive: true });
+  }
+} catch (err) {
+  console.warn('Could not create uploads directory:', err.message);
 }
 
 // Routes
