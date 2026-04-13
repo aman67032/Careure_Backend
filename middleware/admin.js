@@ -1,5 +1,3 @@
-const pool = require('../config/database');
-
 // Check if user is admin (by email or role)
 const isAdmin = async (req, res, next) => {
   try {
@@ -28,4 +26,3 @@ const isAdmin = async (req, res, next) => {
 };
 
 module.exports = { isAdmin };
-

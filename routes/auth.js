@@ -1,7 +1,7 @@
 const express = require('express');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
-const pool = require('../config/database');
+const { Caregiver, Patient } = require('../models');
 const { authenticateToken } = require('../middleware/auth');
 const { validateRegister, validateLogin } = require('../middleware/validate');
 
@@ -40,12 +40,9 @@ router.post('/register', validateRegister, async (req, res) => {
     }
 
     // Check if email already exists
-    const existingUser = await pool.query(
-      'SELECT id FROM caregivers WHERE email = $1',
-      [email]
-    );
+    const existingUser = await Caregiver.findOne({ email: email.toLowerCase() });
 
-    if (existingUser.rows.length > 0) {
+    if (existingUser) {
       return res.status(400).json({ error: 'Email already registered' });
     }
 
@@ -54,18 +51,16 @@ router.post('/register', validateRegister, async (req, res) => {
     const passwordHash = await bcrypt.hash(password, saltRounds);
 
     // Create caregiver
-    const result = await pool.query(
-      `INSERT INTO caregivers (name, email, password_hash, phone)
-       VALUES ($1, $2, $3, $4)
-       RETURNING id, name, email, phone, created_at`,
-      [name, email, passwordHash, phone]
-    );
-
-    const caregiver = result.rows[0];
+    const caregiver = await Caregiver.create({
+      name,
+      email,
+      password_hash: passwordHash,
+      phone
+    });
 
     // Generate JWT token
     const token = jwt.sign(
-      { id: caregiver.id, email: caregiver.email },
+      { id: caregiver._id, email: caregiver.email },
       process.env.JWT_SECRET || 'your_super_secret_jwt_key_change_this_in_production',
       { expiresIn: '7d' }
     );
@@ -74,7 +69,7 @@ router.post('/register', validateRegister, async (req, res) => {
       message: 'Caregiver registered successfully',
       token,
       caregiver: {
-        id: caregiver.id,
+        id: caregiver._id,
         name: caregiver.name,
         email: caregiver.email,
         phone: caregiver.phone
@@ -112,17 +107,13 @@ router.post('/login', validateLogin, async (req, res) => {
     const normalizedEmail = email.toLowerCase().trim();
 
     // Find caregiver (case-insensitive email search)
-    const result = await pool.query(
-      'SELECT id, name, email, password_hash, phone, emergency_contact FROM caregivers WHERE LOWER(email) = $1',
-      [normalizedEmail]
-    );
+    const caregiver = await Caregiver.findOne({ email: normalizedEmail });
 
-    if (result.rows.length === 0) {
+    if (!caregiver) {
       console.log('No caregiver found with email:', normalizedEmail);
       return res.status(401).json({ error: 'Invalid email or password' });
     }
 
-    const caregiver = result.rows[0];
     console.log('Caregiver found:', caregiver.email);
 
     // Verify password
@@ -137,7 +128,7 @@ router.post('/login', validateLogin, async (req, res) => {
 
     // Generate JWT token
     const token = jwt.sign(
-      { id: caregiver.id, email: caregiver.email },
+      { id: caregiver._id, email: caregiver.email },
       process.env.JWT_SECRET || 'your_super_secret_jwt_key_change_this_in_production',
       { expiresIn: '7d' }
     );
@@ -148,7 +139,7 @@ router.post('/login', validateLogin, async (req, res) => {
       message: 'Login successful',
       token,
       caregiver: {
-        id: caregiver.id,
+        id: caregiver._id,
         name: caregiver.name,
         email: caregiver.email,
         phone: caregiver.phone,
@@ -166,16 +157,14 @@ router.post('/login', validateLogin, async (req, res) => {
 // Get Current Caregiver Profile
 router.get('/me', authenticateToken, async (req, res) => {
   try {
-    const result = await pool.query(
-      'SELECT id, name, email, phone, emergency_contact, created_at FROM caregivers WHERE id = $1',
-      [req.user.id]
-    );
+    const caregiver = await Caregiver.findById(req.user.id)
+      .select('name email phone emergency_contact created_at');
 
-    if (result.rows.length === 0) {
+    if (!caregiver) {
       return res.status(404).json({ error: 'Caregiver not found' });
     }
 
-    res.json({ caregiver: result.rows[0] });
+    res.json({ caregiver: { id: caregiver._id, ...caregiver.toObject() } });
   } catch (error) {
     console.error('Get profile error:', error);
     res.status(500).json({ error: 'Internal server error' });
@@ -187,20 +176,20 @@ router.put('/profile', authenticateToken, async (req, res) => {
   try {
     const { name, phone, emergency_contact } = req.body;
 
-    const result = await pool.query(
-      `UPDATE caregivers 
-       SET name = COALESCE($1, name),
-           phone = COALESCE($2, phone),
-           emergency_contact = COALESCE($3, emergency_contact),
-           updated_at = CURRENT_TIMESTAMP
-       WHERE id = $4
-       RETURNING id, name, email, phone, emergency_contact`,
-      [name, phone, emergency_contact, req.user.id]
+    const updateData = {};
+    if (name) updateData.name = name;
+    if (phone) updateData.phone = phone;
+    if (emergency_contact) updateData.emergency_contact = emergency_contact;
+
+    const caregiver = await Caregiver.findByIdAndUpdate(
+      req.user.id,
+      { $set: updateData },
+      { new: true, select: 'name email phone emergency_contact' }
     );
 
     res.json({
       message: 'Profile updated successfully',
-      caregiver: result.rows[0]
+      caregiver: { id: caregiver._id, ...caregiver.toObject() }
     });
   } catch (error) {
     console.error('Update profile error:', error);
@@ -225,16 +214,11 @@ router.post('/change-password', async (req, res) => {
     const normalizedEmail = email.toLowerCase().trim();
 
     // Find caregiver
-    const result = await pool.query(
-      'SELECT id, password_hash FROM caregivers WHERE LOWER(email) = $1',
-      [normalizedEmail]
-    );
+    const caregiver = await Caregiver.findOne({ email: normalizedEmail });
 
-    if (result.rows.length === 0) {
+    if (!caregiver) {
       return res.status(404).json({ error: 'User not found' });
     }
-
-    const caregiver = result.rows[0];
 
     // Verify current password
     const isValidPassword = await bcrypt.compare(currentPassword, caregiver.password_hash);
@@ -248,10 +232,9 @@ router.post('/change-password', async (req, res) => {
     const newPasswordHash = await bcrypt.hash(newPassword, saltRounds);
 
     // Update password
-    await pool.query(
-      'UPDATE caregivers SET password_hash = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2',
-      [newPasswordHash, caregiver.id]
-    );
+    await Caregiver.findByIdAndUpdate(caregiver._id, {
+      $set: { password_hash: newPasswordHash }
+    });
 
     res.json({
       message: 'Password changed successfully'
@@ -277,17 +260,16 @@ router.post('/patient/login', async (req, res) => {
     console.log('Normalized email:', normalizedEmail);
 
     // Find patient by email
-    const result = await pool.query(
-      'SELECT id, name, patient_credentials_email, patient_credentials_password, password_changed FROM patients WHERE LOWER(patient_credentials_email) = $1 AND is_active = true',
-      [normalizedEmail]
-    );
+    const patient = await Patient.findOne({
+      patient_credentials_email: { $regex: new RegExp(`^${normalizedEmail}$`, 'i') },
+      is_active: true
+    });
 
-    if (result.rows.length === 0) {
+    if (!patient) {
       console.log('No patient found with email:', normalizedEmail);
       return res.status(401).json({ error: 'Invalid email or password' });
     }
 
-    const patient = result.rows[0];
     console.log('Patient found:', patient.name, 'Email:', patient.patient_credentials_email);
     console.log('Password hash exists:', !!patient.patient_credentials_password);
 
@@ -304,7 +286,7 @@ router.post('/patient/login', async (req, res) => {
 
     // Generate JWT token for patient
     const token = jwt.sign(
-      { id: patient.id, email: patient.patient_credentials_email, type: 'patient' },
+      { id: patient._id, email: patient.patient_credentials_email, type: 'patient' },
       process.env.JWT_SECRET || 'your_super_secret_jwt_key_change_this_in_production',
       { expiresIn: '30d' }
     );
@@ -313,7 +295,7 @@ router.post('/patient/login', async (req, res) => {
       message: 'Login successful',
       token,
       patient: {
-        id: patient.id,
+        id: patient._id,
         name: patient.name,
         email: patient.patient_credentials_email,
         password_changed: patient.password_changed
@@ -342,16 +324,14 @@ router.post('/patient/change-password', async (req, res) => {
     const normalizedEmail = email.toLowerCase().trim();
 
     // Find patient
-    const result = await pool.query(
-      'SELECT id, patient_credentials_password FROM patients WHERE LOWER(patient_credentials_email) = $1 AND is_active = true',
-      [normalizedEmail]
-    );
+    const patient = await Patient.findOne({
+      patient_credentials_email: { $regex: new RegExp(`^${normalizedEmail}$`, 'i') },
+      is_active: true
+    });
 
-    if (result.rows.length === 0) {
+    if (!patient) {
       return res.status(404).json({ error: 'Patient not found' });
     }
-
-    const patient = result.rows[0];
 
     // Verify current password
     const isValidPassword = await bcrypt.compare(currentPassword, patient.patient_credentials_password);
@@ -365,10 +345,12 @@ router.post('/patient/change-password', async (req, res) => {
     const newPasswordHash = await bcrypt.hash(newPassword, saltRounds);
 
     // Update password and mark as changed
-    await pool.query(
-      'UPDATE patients SET patient_credentials_password = $1, password_changed = true, updated_at = CURRENT_TIMESTAMP WHERE id = $2',
-      [newPasswordHash, patient.id]
-    );
+    await Patient.findByIdAndUpdate(patient._id, {
+      $set: {
+        patient_credentials_password: newPasswordHash,
+        password_changed: true
+      }
+    });
 
     res.json({
       message: 'Password changed successfully'
@@ -380,4 +362,3 @@ router.post('/patient/change-password', async (req, res) => {
 });
 
 module.exports = router;
-

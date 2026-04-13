@@ -1,5 +1,5 @@
 const express = require('express');
-const pool = require('../config/database');
+const { AdherenceLog, Dose, Medication, Reminder, Patient } = require('../models');
 const { authenticateToken } = require('../middleware/auth');
 
 const router = express.Router();
@@ -11,53 +11,44 @@ router.get('/patient/:patientId/adherence', authenticateToken, async (req, res) 
     const { start_date, end_date, medication_id } = req.query;
 
     // Verify ownership
-    const checkResult = await pool.query(
-      'SELECT id FROM patients WHERE id = $1 AND caregiver_id = $2',
-      [patientId, req.user.id]
-    );
+    const patient = await Patient.findOne({
+      _id: patientId,
+      caregiver_id: req.user.id
+    });
 
-    if (checkResult.rows.length === 0) {
+    if (!patient) {
       return res.status(404).json({ error: 'Patient not found' });
     }
 
-    let query = `
-      SELECT 
-        al.date,
-        al.medication_id,
-        m.name as medication_name,
-        al.total_doses,
-        al.taken_doses,
-        al.missed_doses,
-        al.late_doses,
-        al.adherence_percentage
-      FROM adherence_logs al
-      JOIN medications m ON al.medication_id = m.id
-      WHERE al.patient_id = $1
-    `;
-    const params = [patientId];
-    let paramCount = 1;
+    const filter = { patient_id: patientId };
 
     if (start_date) {
-      paramCount++;
-      query += ` AND al.date >= $${paramCount}`;
-      params.push(start_date);
+      filter.date = filter.date || {};
+      filter.date.$gte = new Date(start_date);
     }
 
     if (end_date) {
-      paramCount++;
-      query += ` AND al.date <= $${paramCount}`;
-      params.push(end_date);
+      filter.date = filter.date || {};
+      filter.date.$lte = new Date(end_date);
     }
 
     if (medication_id) {
-      paramCount++;
-      query += ` AND al.medication_id = $${paramCount}`;
-      params.push(medication_id);
+      filter.medication_id = medication_id;
     }
 
-    query += ' ORDER BY al.date DESC, m.name';
+    const adherenceLogs = await AdherenceLog.find(filter)
+      .sort({ date: -1 });
 
-    const result = await pool.query(query, params);
+    // Enrich with medication names
+    const enrichedLogs = await Promise.all(adherenceLogs.map(async (log) => {
+      const logObj = log.toObject();
+      logObj.id = logObj._id;
+
+      const medication = await Medication.findById(log.medication_id);
+      logObj.medication_name = medication ? medication.name : 'Unknown';
+
+      return logObj;
+    }));
 
     // Calculate summary
     const summary = {
@@ -67,10 +58,10 @@ router.get('/patient/:patientId/adherence', authenticateToken, async (req, res) 
       overall_adherence: 0
     };
 
-    result.rows.forEach(row => {
-      summary.total_doses += parseInt(row.total_doses) || 0;
-      summary.taken_doses += parseInt(row.taken_doses) || 0;
-      summary.missed_doses += parseInt(row.missed_doses) || 0;
+    enrichedLogs.forEach(row => {
+      summary.total_doses += row.total_doses || 0;
+      summary.taken_doses += row.taken_doses || 0;
+      summary.missed_doses += row.missed_doses || 0;
     });
 
     if (summary.total_doses > 0) {
@@ -78,7 +69,7 @@ router.get('/patient/:patientId/adherence', authenticateToken, async (req, res) 
     }
 
     res.json({
-      adherence_data: result.rows,
+      adherence_data: enrichedLogs,
       summary
     });
   } catch (error) {
@@ -94,52 +85,57 @@ router.get('/patient/:patientId/doses', authenticateToken, async (req, res) => {
     const { start_date, end_date, status } = req.query;
 
     // Verify ownership
-    const checkResult = await pool.query(
-      'SELECT id FROM patients WHERE id = $1 AND caregiver_id = $2',
-      [patientId, req.user.id]
-    );
+    const patient = await Patient.findOne({
+      _id: patientId,
+      caregiver_id: req.user.id
+    });
 
-    if (checkResult.rows.length === 0) {
+    if (!patient) {
       return res.status(404).json({ error: 'Patient not found' });
     }
 
-    let query = `
-      SELECT 
-        d.*,
-        m.name as medication_name,
-        m.strength,
-        r.time_slot
-      FROM doses d
-      JOIN medications m ON d.medication_id = m.id
-      LEFT JOIN reminders r ON d.reminder_id = r.id
-      WHERE d.patient_id = $1
-    `;
-    const params = [patientId];
-    let paramCount = 1;
+    const filter = { patient_id: patientId };
 
     if (start_date) {
-      paramCount++;
-      query += ` AND d.scheduled_time::date >= $${paramCount}`;
-      params.push(start_date);
+      filter.scheduled_time = filter.scheduled_time || {};
+      filter.scheduled_time.$gte = new Date(start_date);
     }
 
     if (end_date) {
-      paramCount++;
-      query += ` AND d.scheduled_time::date <= $${paramCount}`;
-      params.push(end_date);
+      const endOfDay = new Date(end_date);
+      endOfDay.setHours(23, 59, 59, 999);
+      filter.scheduled_time = filter.scheduled_time || {};
+      filter.scheduled_time.$lte = endOfDay;
     }
 
     if (status) {
-      paramCount++;
-      query += ` AND d.status = $${paramCount}`;
-      params.push(status);
+      filter.status = status;
     }
 
-    query += ' ORDER BY d.scheduled_time DESC LIMIT 100';
+    const doses = await Dose.find(filter)
+      .sort({ scheduled_time: -1 })
+      .limit(100);
 
-    const result = await pool.query(query, params);
+    // Enrich with medication and reminder data
+    const enrichedDoses = await Promise.all(doses.map(async (dose) => {
+      const doseObj = dose.toObject();
+      doseObj.id = doseObj._id;
 
-    res.json({ doses: result.rows });
+      const medication = await Medication.findById(dose.medication_id);
+      const reminder = await Reminder.findById(dose.reminder_id);
+
+      if (medication) {
+        doseObj.medication_name = medication.name;
+        doseObj.strength = medication.strength;
+      }
+      if (reminder) {
+        doseObj.time_slot = reminder.time_slot;
+      }
+
+      return doseObj;
+    }));
+
+    res.json({ doses: enrichedDoses });
   } catch (error) {
     console.error('Get dose history error:', error);
     res.status(500).json({ error: 'Internal server error' });
@@ -152,63 +148,97 @@ router.get('/patient/:patientId/dashboard', authenticateToken, async (req, res) 
     const { patientId } = req.params;
 
     // Verify ownership
-    const checkResult = await pool.query(
-      'SELECT id FROM patients WHERE id = $1 AND caregiver_id = $2',
-      [patientId, req.user.id]
-    );
+    const patient = await Patient.findOne({
+      _id: patientId,
+      caregiver_id: req.user.id
+    });
 
-    if (checkResult.rows.length === 0) {
+    if (!patient) {
       return res.status(404).json({ error: 'Patient not found' });
     }
 
     // Today's stats
-    const todayStats = await pool.query(
-      `SELECT 
-        COUNT(*) FILTER (WHERE status = 'taken') as taken,
-        COUNT(*) FILTER (WHERE status = 'missed') as missed,
-        COUNT(*) FILTER (WHERE status = 'pending') as pending,
-        COUNT(*) as total
-       FROM doses 
-       WHERE patient_id = $1 AND scheduled_time::date = CURRENT_DATE`,
-      [patientId]
-    );
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    const tomorrow = new Date(today);
+    tomorrow.setDate(tomorrow.getDate() + 1);
+
+    const taken = await Dose.countDocuments({
+      patient_id: patientId,
+      status: 'taken',
+      scheduled_time: { $gte: today, $lt: tomorrow }
+    });
+    const missed = await Dose.countDocuments({
+      patient_id: patientId,
+      status: 'missed',
+      scheduled_time: { $gte: today, $lt: tomorrow }
+    });
+    const pending = await Dose.countDocuments({
+      patient_id: patientId,
+      status: 'pending',
+      scheduled_time: { $gte: today, $lt: tomorrow }
+    });
+    const total = await Dose.countDocuments({
+      patient_id: patientId,
+      scheduled_time: { $gte: today, $lt: tomorrow }
+    });
 
     // Weekly adherence
-    const weeklyAdherence = await pool.query(
-      `SELECT 
-        DATE_TRUNC('day', date) as date,
-        AVG(adherence_percentage) as avg_adherence
-       FROM adherence_logs
-       WHERE patient_id = $1 
-         AND date >= CURRENT_DATE - INTERVAL '7 days'
-       GROUP BY DATE_TRUNC('day', date)
-       ORDER BY date`,
-      [patientId]
-    );
+    const sevenDaysAgo = new Date(today);
+    sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
+
+    const weeklyAdherence = await AdherenceLog.aggregate([
+      {
+        $match: {
+          patient_id: patient._id,
+          date: { $gte: sevenDaysAgo }
+        }
+      },
+      {
+        $group: {
+          _id: { $dateToString: { format: '%Y-%m-%d', date: '$date' } },
+          avg_adherence: { $avg: '$adherence_percentage' }
+        }
+      },
+      { $sort: { _id: 1 } }
+    ]);
 
     // Upcoming doses (next 24 hours)
-    const upcomingDoses = await pool.query(
-      `SELECT 
-        d.*,
-        m.name as medication_name,
-        m.strength,
-        r.time_slot
-       FROM doses d
-       JOIN medications m ON d.medication_id = m.id
-       LEFT JOIN reminders r ON d.reminder_id = r.id
-       WHERE d.patient_id = $1 
-         AND d.status = 'pending'
-         AND d.scheduled_time > CURRENT_TIMESTAMP
-         AND d.scheduled_time <= CURRENT_TIMESTAMP + INTERVAL '24 hours'
-       ORDER BY d.scheduled_time
-       LIMIT 10`,
-      [patientId]
-    );
+    const now = new Date();
+    const next24h = new Date(now.getTime() + 24 * 60 * 60 * 1000);
+
+    const upcomingDoses = await Dose.find({
+      patient_id: patientId,
+      status: 'pending',
+      scheduled_time: { $gt: now, $lte: next24h }
+    }).sort({ scheduled_time: 1 }).limit(10);
+
+    // Enrich upcoming doses
+    const enrichedUpcoming = await Promise.all(upcomingDoses.map(async (dose) => {
+      const doseObj = dose.toObject();
+      doseObj.id = doseObj._id;
+
+      const medication = await Medication.findById(dose.medication_id);
+      const reminder = await Reminder.findById(dose.reminder_id);
+
+      if (medication) {
+        doseObj.medication_name = medication.name;
+        doseObj.strength = medication.strength;
+      }
+      if (reminder) {
+        doseObj.time_slot = reminder.time_slot;
+      }
+
+      return doseObj;
+    }));
 
     res.json({
-      today_stats: todayStats.rows[0],
-      weekly_adherence: weeklyAdherence.rows,
-      upcoming_doses: upcomingDoses.rows
+      today_stats: { taken, missed, pending, total },
+      weekly_adherence: weeklyAdherence.map(w => ({
+        date: w._id,
+        avg_adherence: w.avg_adherence
+      })),
+      upcoming_doses: enrichedUpcoming
     });
   } catch (error) {
     console.error('Get dashboard stats error:', error);
@@ -217,4 +247,3 @@ router.get('/patient/:patientId/dashboard', authenticateToken, async (req, res) 
 });
 
 module.exports = router;
-

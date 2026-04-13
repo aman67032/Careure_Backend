@@ -1,5 +1,5 @@
 const express = require('express');
-const pool = require('../config/database');
+const { Alert, Patient } = require('../models');
 const { authenticateToken } = require('../middleware/auth');
 
 const router = express.Router();
@@ -9,38 +9,38 @@ router.get('/', authenticateToken, async (req, res) => {
   try {
     const { type, is_read, patient_id } = req.query;
 
-    let query = `
-      SELECT a.*, p.name as patient_name
-      FROM alerts a
-      LEFT JOIN patients p ON a.patient_id = p.id
-      WHERE a.caregiver_id = $1
-    `;
-    const params = [req.user.id];
-    let paramCount = 1;
+    const filter = { caregiver_id: req.user.id };
 
     if (type) {
-      paramCount++;
-      query += ` AND a.alert_type = $${paramCount}`;
-      params.push(type);
+      filter.alert_type = type;
     }
 
     if (is_read !== undefined) {
-      paramCount++;
-      query += ` AND a.is_read = $${paramCount}`;
-      params.push(is_read === 'true');
+      filter.is_read = is_read === 'true';
     }
 
     if (patient_id) {
-      paramCount++;
-      query += ` AND a.patient_id = $${paramCount}`;
-      params.push(patient_id);
+      filter.patient_id = patient_id;
     }
 
-    query += ' ORDER BY a.created_at DESC LIMIT 50';
+    const alerts = await Alert.find(filter)
+      .sort({ created_at: -1 })
+      .limit(50);
 
-    const result = await pool.query(query, params);
+    // Enrich with patient names
+    const enrichedAlerts = await Promise.all(alerts.map(async (alert) => {
+      const alertObj = alert.toObject();
+      alertObj.id = alertObj._id;
 
-    res.json({ alerts: result.rows });
+      if (alert.patient_id) {
+        const patient = await Patient.findById(alert.patient_id).select('name');
+        alertObj.patient_name = patient ? patient.name : null;
+      }
+
+      return alertObj;
+    }));
+
+    res.json({ alerts: enrichedAlerts });
   } catch (error) {
     console.error('Get alerts error:', error);
     res.status(500).json({ error: 'Internal server error' });
@@ -52,19 +52,20 @@ router.put('/:id/read', authenticateToken, async (req, res) => {
   try {
     const { id } = req.params;
 
-    const result = await pool.query(
-      `UPDATE alerts 
-       SET is_read = true 
-       WHERE id = $1 AND caregiver_id = $2
-       RETURNING *`,
-      [id, req.user.id]
+    const alert = await Alert.findOneAndUpdate(
+      { _id: id, caregiver_id: req.user.id },
+      { $set: { is_read: true } },
+      { new: true }
     );
 
-    if (result.rows.length === 0) {
+    if (!alert) {
       return res.status(404).json({ error: 'Alert not found' });
     }
 
-    res.json({ message: 'Alert marked as read', alert: result.rows[0] });
+    const alertObj = alert.toObject();
+    alertObj.id = alertObj._id;
+
+    res.json({ message: 'Alert marked as read', alert: alertObj });
   } catch (error) {
     console.error('Mark alert read error:', error);
     res.status(500).json({ error: 'Internal server error' });
@@ -74,9 +75,9 @@ router.put('/:id/read', authenticateToken, async (req, res) => {
 // Mark all alerts as read
 router.put('/read-all', authenticateToken, async (req, res) => {
   try {
-    await pool.query(
-      'UPDATE alerts SET is_read = true WHERE caregiver_id = $1 AND is_read = false',
-      [req.user.id]
+    await Alert.updateMany(
+      { caregiver_id: req.user.id, is_read: false },
+      { $set: { is_read: true } }
     );
 
     res.json({ message: 'All alerts marked as read' });
@@ -89,12 +90,12 @@ router.put('/read-all', authenticateToken, async (req, res) => {
 // Get unread count
 router.get('/unread-count', authenticateToken, async (req, res) => {
   try {
-    const result = await pool.query(
-      'SELECT COUNT(*) FROM alerts WHERE caregiver_id = $1 AND is_read = false',
-      [req.user.id]
-    );
+    const count = await Alert.countDocuments({
+      caregiver_id: req.user.id,
+      is_read: false
+    });
 
-    res.json({ count: parseInt(result.rows[0].count) });
+    res.json({ count });
   } catch (error) {
     console.error('Get unread count error:', error);
     res.status(500).json({ error: 'Internal server error' });
@@ -102,4 +103,3 @@ router.get('/unread-count', authenticateToken, async (req, res) => {
 });
 
 module.exports = router;
-

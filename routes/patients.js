@@ -1,5 +1,5 @@
 const express = require('express');
-const pool = require('../config/database');
+const { Patient, Medication, Dose, Device } = require('../models');
 const { authenticateToken } = require('../middleware/auth');
 const { validatePatient } = require('../middleware/validate');
 const bcrypt = require('bcryptjs');
@@ -10,21 +10,49 @@ const router = express.Router();
 // Get all patients for caregiver
 router.get('/', authenticateToken, async (req, res) => {
   try {
-    const result = await pool.query(
-      `SELECT p.*, 
-              COUNT(DISTINCT m.id) as medication_count,
-              COUNT(DISTINCT d.id) FILTER (WHERE d.status = 'taken' AND d.scheduled_time::date = CURRENT_DATE) as today_taken,
-              COUNT(DISTINCT d.id) FILTER (WHERE d.status = 'missed' AND d.scheduled_time::date = CURRENT_DATE) as today_missed
-       FROM patients p
-       LEFT JOIN medications m ON p.id = m.patient_id AND m.is_active = true
-       LEFT JOIN doses d ON p.id = d.patient_id
-       WHERE p.caregiver_id = $1 AND p.is_active = true
-       GROUP BY p.id
-       ORDER BY p.created_at DESC`,
-      [req.user.id]
-    );
+    const patients = await Patient.find({
+      caregiver_id: req.user.id,
+      is_active: true
+    }).sort({ created_at: -1 });
 
-    res.json({ patients: result.rows });
+    // Enrich with medication count and today's stats
+    const enrichedPatients = await Promise.all(patients.map(async (patient) => {
+      const patientObj = patient.toObject();
+      patientObj.id = patientObj._id;
+
+      // Medication count
+      const medicationCount = await Medication.countDocuments({
+        patient_id: patient._id,
+        is_active: true
+      });
+
+      // Today's dose stats
+      const today = new Date();
+      today.setHours(0, 0, 0, 0);
+      const tomorrow = new Date(today);
+      tomorrow.setDate(tomorrow.getDate() + 1);
+
+      const todayTaken = await Dose.countDocuments({
+        patient_id: patient._id,
+        status: 'taken',
+        scheduled_time: { $gte: today, $lt: tomorrow }
+      });
+
+      const todayMissed = await Dose.countDocuments({
+        patient_id: patient._id,
+        status: 'missed',
+        scheduled_time: { $gte: today, $lt: tomorrow }
+      });
+
+      return {
+        ...patientObj,
+        medication_count: medicationCount,
+        today_taken: todayTaken,
+        today_missed: todayMissed
+      };
+    }));
+
+    res.json({ patients: enrichedPatients });
   } catch (error) {
     console.error('Get patients error:', error);
     res.status(500).json({ error: 'Internal server error' });
@@ -37,46 +65,55 @@ router.get('/:id', authenticateToken, async (req, res) => {
     const { id } = req.params;
 
     // Verify patient belongs to caregiver
-    const patientResult = await pool.query(
-      'SELECT * FROM patients WHERE id = $1 AND caregiver_id = $2',
-      [id, req.user.id]
-    );
+    const patient = await Patient.findOne({
+      _id: id,
+      caregiver_id: req.user.id
+    });
 
-    if (patientResult.rows.length === 0) {
+    if (!patient) {
       return res.status(404).json({ error: 'Patient not found' });
     }
 
-    const patient = patientResult.rows[0];
+    const patientObj = patient.toObject();
+    patientObj.id = patientObj._id;
 
     // Get medications count
-    const medCount = await pool.query(
-      'SELECT COUNT(*) FROM medications WHERE patient_id = $1 AND is_active = true',
-      [id]
-    );
+    const medicationCount = await Medication.countDocuments({
+      patient_id: id,
+      is_active: true
+    });
 
     // Get today's adherence
-    const todayDoses = await pool.query(
-      `SELECT 
-        COUNT(*) FILTER (WHERE status = 'taken') as taken,
-        COUNT(*) FILTER (WHERE status = 'missed') as missed,
-        COUNT(*) FILTER (WHERE status = 'pending') as pending
-       FROM doses 
-       WHERE patient_id = $1 AND scheduled_time::date = CURRENT_DATE`,
-      [id]
-    );
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    const tomorrow = new Date(today);
+    tomorrow.setDate(tomorrow.getDate() + 1);
+
+    const taken = await Dose.countDocuments({
+      patient_id: id,
+      status: 'taken',
+      scheduled_time: { $gte: today, $lt: tomorrow }
+    });
+    const missed = await Dose.countDocuments({
+      patient_id: id,
+      status: 'missed',
+      scheduled_time: { $gte: today, $lt: tomorrow }
+    });
+    const pending = await Dose.countDocuments({
+      patient_id: id,
+      status: 'pending',
+      scheduled_time: { $gte: today, $lt: tomorrow }
+    });
 
     // Get device status
-    const device = await pool.query(
-      'SELECT * FROM devices WHERE patient_id = $1 ORDER BY created_at DESC LIMIT 1',
-      [id]
-    );
+    const device = await Device.findOne({ patient_id: id }).sort({ created_at: -1 });
 
     res.json({
       patient: {
-        ...patient,
-        medication_count: parseInt(medCount.rows[0].count),
-        today_stats: todayDoses.rows[0],
-        device: device.rows[0] || null
+        ...patientObj,
+        medication_count: medicationCount,
+        today_stats: { taken, missed, pending },
+        device: device ? device.toObject() : null
       }
     });
   } catch (error) {
@@ -102,7 +139,7 @@ router.post('/', authenticateToken, validatePatient, async (req, res) => {
 
     // Generate patient credentials
     const patientEmail = `patient_${crypto.randomBytes(8).toString('hex')}@caresure.local`;
-    // Generate a more user-friendly password (alphanumeric + some special chars, no problematic base64 chars)
+    // Generate a more user-friendly password
     const passwordChars = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789!@#$%&*';
     let patientPassword = '';
     for (let i = 0; i < 12; i++) {
@@ -111,29 +148,28 @@ router.post('/', authenticateToken, validatePatient, async (req, res) => {
     const passwordHash = await bcrypt.hash(patientPassword, 10);
 
     // Create patient
-    const result = await pool.query(
-      `INSERT INTO patients (
-        caregiver_id, name, age, gender, relationship, allergies, 
-        medical_conditions, emergency_contact, doctor_name, doctor_contact,
-        patient_credentials_email, patient_credentials_password
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-      RETURNING *`,
-      [
-        req.user.id, name, age, gender, relationship, allergies,
-        medical_conditions, emergency_contact, doctor_name, doctor_contact,
-        patientEmail, passwordHash
-      ]
-    );
+    const patient = await Patient.create({
+      caregiver_id: req.user.id,
+      name,
+      age,
+      gender,
+      relationship,
+      allergies,
+      medical_conditions,
+      emergency_contact,
+      doctor_name,
+      doctor_contact,
+      patient_credentials_email: patientEmail,
+      patient_credentials_password: passwordHash
+    });
 
-    const patient = result.rows[0];
-
-    // Note: In production, integrate payment gateway here (50rs charge)
-    // For now, we'll just create the patient
+    const patientObj = patient.toObject();
+    patientObj.id = patientObj._id;
 
     res.status(201).json({
       message: 'Patient created successfully',
       patient: {
-        ...patient,
+        ...patientObj,
         patient_credentials: {
           email: patientEmail,
           password: patientPassword // Only shown once
@@ -156,36 +192,38 @@ router.put('/:id', authenticateToken, async (req, res) => {
     } = req.body;
 
     // Verify ownership
-    const checkResult = await pool.query(
-      'SELECT id FROM patients WHERE id = $1 AND caregiver_id = $2',
-      [id, req.user.id]
-    );
+    const existingPatient = await Patient.findOne({
+      _id: id,
+      caregiver_id: req.user.id
+    });
 
-    if (checkResult.rows.length === 0) {
+    if (!existingPatient) {
       return res.status(404).json({ error: 'Patient not found' });
     }
 
-    const result = await pool.query(
-      `UPDATE patients 
-       SET name = COALESCE($1, name),
-           age = COALESCE($2, age),
-           gender = COALESCE($3, gender),
-           relationship = COALESCE($4, relationship),
-           allergies = COALESCE($5, allergies),
-           medical_conditions = COALESCE($6, medical_conditions),
-           emergency_contact = COALESCE($7, emergency_contact),
-           doctor_name = COALESCE($8, doctor_name),
-           doctor_contact = COALESCE($9, doctor_contact),
-           updated_at = CURRENT_TIMESTAMP
-       WHERE id = $10
-       RETURNING *`,
-      [name, age, gender, relationship, allergies, medical_conditions,
-       emergency_contact, doctor_name, doctor_contact, id]
+    const updateData = {};
+    if (name !== undefined) updateData.name = name;
+    if (age !== undefined) updateData.age = age;
+    if (gender !== undefined) updateData.gender = gender;
+    if (relationship !== undefined) updateData.relationship = relationship;
+    if (allergies !== undefined) updateData.allergies = allergies;
+    if (medical_conditions !== undefined) updateData.medical_conditions = medical_conditions;
+    if (emergency_contact !== undefined) updateData.emergency_contact = emergency_contact;
+    if (doctor_name !== undefined) updateData.doctor_name = doctor_name;
+    if (doctor_contact !== undefined) updateData.doctor_contact = doctor_contact;
+
+    const patient = await Patient.findByIdAndUpdate(
+      id,
+      { $set: updateData },
+      { new: true }
     );
+
+    const patientObj = patient.toObject();
+    patientObj.id = patientObj._id;
 
     res.json({
       message: 'Patient updated successfully',
-      patient: result.rows[0]
+      patient: patientObj
     });
   } catch (error) {
     console.error('Update patient error:', error);
@@ -199,19 +237,18 @@ router.delete('/:id', authenticateToken, async (req, res) => {
     const { id } = req.params;
 
     // Verify ownership
-    const checkResult = await pool.query(
-      'SELECT id FROM patients WHERE id = $1 AND caregiver_id = $2',
-      [id, req.user.id]
-    );
+    const existingPatient = await Patient.findOne({
+      _id: id,
+      caregiver_id: req.user.id
+    });
 
-    if (checkResult.rows.length === 0) {
+    if (!existingPatient) {
       return res.status(404).json({ error: 'Patient not found' });
     }
 
-    await pool.query(
-      'UPDATE patients SET is_active = false, updated_at = CURRENT_TIMESTAMP WHERE id = $1',
-      [id]
-    );
+    await Patient.findByIdAndUpdate(id, {
+      $set: { is_active: false }
+    });
 
     res.json({ message: 'Patient deleted successfully' });
   } catch (error) {
@@ -221,4 +258,3 @@ router.delete('/:id', authenticateToken, async (req, res) => {
 });
 
 module.exports = router;
-

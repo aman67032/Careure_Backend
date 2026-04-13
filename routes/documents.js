@@ -1,5 +1,5 @@
 const express = require('express');
-const pool = require('../config/database');
+const { MedicalDocument, Patient } = require('../models');
 const { authenticateToken } = require('../middleware/auth');
 const multer = require('multer');
 const path = require('path');
@@ -39,21 +39,19 @@ router.get('/patient/:patientId', authenticateToken, async (req, res) => {
     const { patientId } = req.params;
 
     // Verify ownership
-    const checkResult = await pool.query(
-      'SELECT id FROM patients WHERE id = $1 AND caregiver_id = $2',
-      [patientId, req.user.id]
-    );
+    const patient = await Patient.findOne({
+      _id: patientId,
+      caregiver_id: req.user.id
+    });
 
-    if (checkResult.rows.length === 0) {
+    if (!patient) {
       return res.status(404).json({ error: 'Patient not found' });
     }
 
-    const result = await pool.query(
-      'SELECT * FROM medical_documents WHERE patient_id = $1 ORDER BY created_at DESC',
-      [patientId]
-    );
+    const documents = await MedicalDocument.find({ patient_id: patientId })
+      .sort({ created_at: -1 });
 
-    res.json({ documents: result.rows });
+    res.json({ documents: documents.map(d => { const obj = d.toObject(); obj.id = obj._id; return obj; }) });
   } catch (error) {
     console.error('Get documents error:', error);
     res.status(500).json({ error: 'Internal server error' });
@@ -67,12 +65,12 @@ router.post('/patient/:patientId/upload', authenticateToken, upload.single('docu
     const { document_type } = req.body;
 
     // Verify ownership
-    const checkResult = await pool.query(
-      'SELECT id FROM patients WHERE id = $1 AND caregiver_id = $2',
-      [patientId, req.user.id]
-    );
+    const patient = await Patient.findOne({
+      _id: patientId,
+      caregiver_id: req.user.id
+    });
 
-    if (checkResult.rows.length === 0) {
+    if (!patient) {
       return res.status(404).json({ error: 'Patient not found' });
     }
 
@@ -80,16 +78,20 @@ router.post('/patient/:patientId/upload', authenticateToken, upload.single('docu
       return res.status(400).json({ error: 'No file uploaded' });
     }
 
-    const result = await pool.query(
-      `INSERT INTO medical_documents (patient_id, document_type, file_name, file_path, uploaded_by)
-       VALUES ($1, $2, $3, $4, $5)
-       RETURNING *`,
-      [patientId, document_type, req.file.originalname, req.file.path, req.user.id]
-    );
+    const document = await MedicalDocument.create({
+      patient_id: patientId,
+      document_type: document_type,
+      file_name: req.file.originalname,
+      file_path: req.file.path,
+      uploaded_by: req.user.id
+    });
+
+    const docObj = document.toObject();
+    docObj.id = docObj._id;
 
     res.status(201).json({
       message: 'Document uploaded successfully',
-      document: result.rows[0]
+      document: docObj
     });
   } catch (error) {
     console.error('Upload document error:', error);
@@ -102,27 +104,29 @@ router.delete('/:id', authenticateToken, async (req, res) => {
   try {
     const { id } = req.params;
 
-    // Verify ownership
-    const checkResult = await pool.query(
-      `SELECT md.* FROM medical_documents md
-       JOIN patients p ON md.patient_id = p.id
-       WHERE md.id = $1 AND p.caregiver_id = $2`,
-      [id, req.user.id]
-    );
+    // Find document and verify ownership through patient
+    const document = await MedicalDocument.findById(id);
+    if (!document) {
+      return res.status(404).json({ error: 'Document not found' });
+    }
 
-    if (checkResult.rows.length === 0) {
+    const patient = await Patient.findOne({
+      _id: document.patient_id,
+      caregiver_id: req.user.id
+    });
+
+    if (!patient) {
       return res.status(404).json({ error: 'Document not found' });
     }
 
     const fs = require('fs');
-    const document = checkResult.rows[0];
     
     // Delete file from filesystem
     if (document.file_path && fs.existsSync(document.file_path)) {
       fs.unlinkSync(document.file_path);
     }
 
-    await pool.query('DELETE FROM medical_documents WHERE id = $1', [id]);
+    await MedicalDocument.findByIdAndDelete(id);
 
     res.json({ message: 'Document deleted successfully' });
   } catch (error) {
@@ -132,4 +136,3 @@ router.delete('/:id', authenticateToken, async (req, res) => {
 });
 
 module.exports = router;
-

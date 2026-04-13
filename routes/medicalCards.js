@@ -1,5 +1,5 @@
 const express = require('express');
-const pool = require('../config/database');
+const { MedicalCard, Patient, Medication, Reminder } = require('../models');
 const { authenticateToken } = require('../middleware/auth');
 const crypto = require('crypto');
 
@@ -12,12 +12,12 @@ router.post('/patient/:patientId/generate', authenticateToken, async (req, res) 
     const { consent_given = false } = req.body;
 
     // Verify ownership
-    const checkResult = await pool.query(
-      'SELECT id FROM patients WHERE id = $1 AND caregiver_id = $2',
-      [patientId, req.user.id]
-    );
+    const patient = await Patient.findOne({
+      _id: patientId,
+      caregiver_id: req.user.id
+    });
 
-    if (checkResult.rows.length === 0) {
+    if (!patient) {
       return res.status(404).json({ error: 'Patient not found' });
     }
 
@@ -31,54 +31,61 @@ router.post('/patient/:patientId/generate', authenticateToken, async (req, res) 
     expiresAt.setFullYear(expiresAt.getFullYear() + 1); // Valid for 1 year
 
     // Check if card exists
-    const existingCard = await pool.query(
-      'SELECT * FROM medical_cards WHERE patient_id = $1 AND is_active = true',
-      [patientId]
-    );
+    let card = await MedicalCard.findOne({
+      patient_id: patientId,
+      is_active: true
+    });
 
-    let card;
-    if (existingCard.rows.length > 0) {
+    if (card) {
       // Update existing card
-      await pool.query(
-        `UPDATE medical_cards 
-         SET qr_code = $1, consent_given = $2, expires_at = $3, updated_at = CURRENT_TIMESTAMP
-         WHERE patient_id = $4`,
-        [qrCode, consent_given, expiresAt, patientId]
-      );
-      card = existingCard.rows[0];
-      card.qr_code = qrCode;
+      card = await MedicalCard.findByIdAndUpdate(card._id, {
+        $set: {
+          qr_code: qrCode,
+          consent_given: consent_given,
+          expires_at: expiresAt
+        }
+      }, { new: true });
     } else {
       // Create new card
-      const result = await pool.query(
-        `INSERT INTO medical_cards (patient_id, qr_code, consent_given, expires_at)
-         VALUES ($1, $2, $3, $4)
-         RETURNING *`,
-        [patientId, qrCode, consent_given, expiresAt]
-      );
-      card = result.rows[0];
+      card = await MedicalCard.create({
+        patient_id: patientId,
+        qr_code: qrCode,
+        consent_given: consent_given,
+        expires_at: expiresAt
+      });
     }
 
     // Get patient data for card
-    const patientResult = await pool.query(
-      'SELECT * FROM patients WHERE id = $1',
-      [patientId]
-    );
+    const patientData = patient.toObject();
 
-    const medicationsResult = await pool.query(
-      `SELECT m.*, STRING_AGG(r.time_slot, ', ') as time_slots
-       FROM medications m
-       LEFT JOIN reminders r ON m.id = r.medication_id AND r.is_active = true
-       WHERE m.patient_id = $1 AND m.is_active = true
-       GROUP BY m.id`,
-      [patientId]
-    );
+    // Get medications with time slots
+    const medications = await Medication.find({
+      patient_id: patientId,
+      is_active: true
+    });
+
+    const enrichedMeds = await Promise.all(medications.map(async (med) => {
+      const medObj = med.toObject();
+      medObj.id = medObj._id;
+
+      const reminders = await Reminder.find({
+        medication_id: med._id,
+        is_active: true
+      });
+
+      medObj.time_slots = [...new Set(reminders.map(r => r.time_slot))].join(', ');
+      return medObj;
+    }));
+
+    const cardObj = card.toObject();
+    cardObj.id = cardObj._id;
 
     res.json({
       message: 'Medical card generated successfully',
       card: {
-        ...card,
-        patient: patientResult.rows[0],
-        medications: medicationsResult.rows
+        ...cardObj,
+        patient: patientData,
+        medications: enrichedMeds
       }
     });
   } catch (error) {
@@ -93,46 +100,54 @@ router.get('/patient/:patientId', authenticateToken, async (req, res) => {
     const { patientId } = req.params;
 
     // Verify ownership
-    const checkResult = await pool.query(
-      'SELECT id FROM patients WHERE id = $1 AND caregiver_id = $2',
-      [patientId, req.user.id]
-    );
+    const patient = await Patient.findOne({
+      _id: patientId,
+      caregiver_id: req.user.id
+    });
 
-    if (checkResult.rows.length === 0) {
+    if (!patient) {
       return res.status(404).json({ error: 'Patient not found' });
     }
 
-    const cardResult = await pool.query(
-      'SELECT * FROM medical_cards WHERE patient_id = $1 AND is_active = true',
-      [patientId]
-    );
+    const card = await MedicalCard.findOne({
+      patient_id: patientId,
+      is_active: true
+    });
 
-    if (cardResult.rows.length === 0) {
+    if (!card) {
       return res.json({ card: null });
     }
 
-    const card = cardResult.rows[0];
-
     // Get patient data
-    const patientResult = await pool.query(
-      'SELECT * FROM patients WHERE id = $1',
-      [patientId]
-    );
+    const patientData = patient.toObject();
 
-    const medicationsResult = await pool.query(
-      `SELECT m.*, STRING_AGG(r.time_slot, ', ') as time_slots
-       FROM medications m
-       LEFT JOIN reminders r ON m.id = r.medication_id AND r.is_active = true
-       WHERE m.patient_id = $1 AND m.is_active = true
-       GROUP BY m.id`,
-      [patientId]
-    );
+    // Get medications with time slots
+    const medications = await Medication.find({
+      patient_id: patientId,
+      is_active: true
+    });
+
+    const enrichedMeds = await Promise.all(medications.map(async (med) => {
+      const medObj = med.toObject();
+      medObj.id = medObj._id;
+
+      const reminders = await Reminder.find({
+        medication_id: med._id,
+        is_active: true
+      });
+
+      medObj.time_slots = [...new Set(reminders.map(r => r.time_slot))].join(', ');
+      return medObj;
+    }));
+
+    const cardObj = card.toObject();
+    cardObj.id = cardObj._id;
 
     res.json({
       card: {
-        ...card,
-        patient: patientResult.rows[0],
-        medications: medicationsResult.rows
+        ...cardObj,
+        patient: patientData,
+        medications: enrichedMeds
       }
     });
   } catch (error) {
@@ -146,46 +161,50 @@ router.get('/qr/:qrCode', async (req, res) => {
   try {
     const { qrCode } = req.params;
 
-    const cardResult = await pool.query(
-      `SELECT * FROM medical_cards 
-       WHERE qr_code = $1 
-         AND is_active = true 
-         AND (expires_at IS NULL OR expires_at > CURRENT_TIMESTAMP)`,
-      [qrCode]
-    );
+    const card = await MedicalCard.findOne({
+      qr_code: qrCode,
+      is_active: true,
+      $or: [
+        { expires_at: null },
+        { expires_at: { $gt: new Date() } }
+      ]
+    });
 
-    if (cardResult.rows.length === 0) {
+    if (!card) {
       return res.status(404).json({ error: 'Medical card not found or expired' });
     }
-
-    const card = cardResult.rows[0];
 
     if (!card.consent_given) {
       return res.status(403).json({ error: 'Data sharing consent not given' });
     }
 
     // Get patient data (limited info for privacy)
-    const patientResult = await pool.query(
-      `SELECT name, age, gender, allergies, medical_conditions, emergency_contact
-       FROM patients WHERE id = $1`,
-      [card.patient_id]
-    );
+    const patient = await Patient.findById(card.patient_id)
+      .select('name age gender allergies medical_conditions emergency_contact');
 
-    const medicationsResult = await pool.query(
-      `SELECT m.name, m.strength, m.dose_per_intake, m.frequency,
-              STRING_AGG(r.time_slot, ', ') as time_slots
-       FROM medications m
-       LEFT JOIN reminders r ON m.id = r.medication_id AND r.is_active = true
-       WHERE m.patient_id = $1 AND m.is_active = true
-       GROUP BY m.id`,
-      [card.patient_id]
-    );
+    // Get medications with time slots
+    const medications = await Medication.find({
+      patient_id: card.patient_id,
+      is_active: true
+    }).select('name strength dose_per_intake frequency');
+
+    const enrichedMeds = await Promise.all(medications.map(async (med) => {
+      const medObj = med.toObject();
+
+      const reminders = await Reminder.find({
+        medication_id: med._id,
+        is_active: true
+      });
+
+      medObj.time_slots = [...new Set(reminders.map(r => r.time_slot))].join(', ');
+      return medObj;
+    }));
 
     res.json({
       card: {
         qr_code: card.qr_code,
-        patient: patientResult.rows[0],
-        medications: medicationsResult.rows,
+        patient: patient ? patient.toObject() : null,
+        medications: enrichedMeds,
         generated_at: card.created_at
       }
     });
@@ -196,4 +215,3 @@ router.get('/qr/:qrCode', async (req, res) => {
 });
 
 module.exports = router;
-

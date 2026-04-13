@@ -1,5 +1,5 @@
 const express = require('express');
-const pool = require('../config/database');
+const { Reminder, Medication, Patient, Dose, Alert, AdherenceLog } = require('../models');
 const { authenticateToken } = require('../middleware/auth');
 const cron = require('node-cron');
 
@@ -11,23 +11,26 @@ router.get('/medication/:medicationId', authenticateToken, async (req, res) => {
     const { medicationId } = req.params;
 
     // Verify ownership
-    const checkResult = await pool.query(
-      `SELECT m.id FROM medications m
-       JOIN patients p ON m.patient_id = p.id
-       WHERE m.id = $1 AND p.caregiver_id = $2`,
-      [medicationId, req.user.id]
-    );
-
-    if (checkResult.rows.length === 0) {
+    const medication = await Medication.findById(medicationId);
+    if (!medication) {
       return res.status(404).json({ error: 'Medication not found' });
     }
 
-    const result = await pool.query(
-      'SELECT * FROM reminders WHERE medication_id = $1 AND is_active = true ORDER BY exact_time',
-      [medicationId]
-    );
+    const patient = await Patient.findOne({
+      _id: medication.patient_id,
+      caregiver_id: req.user.id
+    });
 
-    res.json({ reminders: result.rows });
+    if (!patient) {
+      return res.status(404).json({ error: 'Medication not found' });
+    }
+
+    const reminders = await Reminder.find({
+      medication_id: medicationId,
+      is_active: true
+    }).sort({ exact_time: 1 });
+
+    res.json({ reminders: reminders.map(r => { const obj = r.toObject(); obj.id = obj._id; return obj; }) });
   } catch (error) {
     console.error('Get reminders error:', error);
     res.status(500).json({ error: 'Internal server error' });
@@ -41,51 +44,49 @@ router.post('/medication/:medicationId', authenticateToken, async (req, res) => 
     const { reminders } = req.body; // Array of reminder objects
 
     // Verify ownership
-    const medResult = await pool.query(
-      `SELECT m.*, p.id as patient_id FROM medications m
-       JOIN patients p ON m.patient_id = p.id
-       WHERE m.id = $1 AND p.caregiver_id = $2`,
-      [medicationId, req.user.id]
-    );
-
-    if (medResult.rows.length === 0) {
+    const medication = await Medication.findById(medicationId);
+    if (!medication) {
       return res.status(404).json({ error: 'Medication not found' });
     }
 
-    const medication = medResult.rows[0];
+    const patient = await Patient.findOne({
+      _id: medication.patient_id,
+      caregiver_id: req.user.id
+    });
+
+    if (!patient) {
+      return res.status(404).json({ error: 'Medication not found' });
+    }
+
     const patientId = medication.patient_id;
 
-    // Delete existing reminders
-    await pool.query(
-      'UPDATE reminders SET is_active = false WHERE medication_id = $1',
-      [medicationId]
+    // Deactivate existing reminders
+    await Reminder.updateMany(
+      { medication_id: medicationId },
+      { $set: { is_active: false } }
     );
 
     // Create new reminders
     const createdReminders = [];
     for (const reminder of reminders) {
-      const result = await pool.query(
-        `INSERT INTO reminders (
-          medication_id, time_slot, exact_time, time_window_start, time_window_end,
-          food_rule, delay_on_meal_missed, notify_device, notify_mobile
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-        RETURNING *`,
-        [
-          medicationId,
-          reminder.time_slot,
-          reminder.exact_time,
-          reminder.time_window_start,
-          reminder.time_window_end,
-          reminder.food_rule,
-          reminder.delay_on_meal_missed || false,
-          reminder.notify_device !== false,
-          reminder.notify_mobile !== false
-        ]
-      );
-      createdReminders.push(result.rows[0]);
+      const newReminder = await Reminder.create({
+        medication_id: medicationId,
+        time_slot: reminder.time_slot,
+        exact_time: reminder.exact_time,
+        time_window_start: reminder.time_window_start,
+        time_window_end: reminder.time_window_end,
+        food_rule: reminder.food_rule,
+        delay_on_meal_missed: reminder.delay_on_meal_missed || false,
+        notify_device: reminder.notify_device !== false,
+        notify_mobile: reminder.notify_mobile !== false
+      });
+
+      const reminderObj = newReminder.toObject();
+      reminderObj.id = reminderObj._id;
+      createdReminders.push(reminderObj);
 
       // Schedule doses for next 30 days
-      await scheduleDoses(patientId, medicationId, result.rows[0].id, reminder);
+      await scheduleDoses(patientId, medicationId, newReminder._id, reminder);
     }
 
     res.status(201).json({
@@ -102,81 +103,39 @@ router.post('/medication/:medicationId', authenticateToken, async (req, res) => 
 async function scheduleDoses(patientId, medicationId, reminderId, reminder) {
   try {
     const [hours, minutes] = reminder.exact_time.split(':').map(Number);
-    const timeStr = `${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}:00`;
-    
-    console.log(`📅 Scheduling doses for patient ${patientId}, medication ${medicationId}, reminder ${reminderId}, time ${timeStr}`);
-    
-    // Use PostgreSQL to create dates properly to avoid timezone issues
-    // Schedule doses for the next 30 days starting from TODAY (i=0 is today)
+
+    console.log(`📅 Scheduling doses for patient ${patientId}, medication ${medicationId}, reminder ${reminderId}, time ${hours}:${minutes}`);
+
+    // Schedule doses for the next 30 days starting from TODAY
     for (let i = 0; i < 30; i++) {
       try {
-        // Check if dose already exists for this reminder, patient, and date
-        // Use parameterized query for safety
-        let existingQuery;
-        if (i === 0) {
-          // For today, check against CURRENT_DATE directly
-          existingQuery = await pool.query(
-            `SELECT id FROM doses 
-             WHERE reminder_id = $1 
-               AND patient_id = $2 
-               AND scheduled_time::date = CURRENT_DATE`,
-            [reminderId, patientId]
-          );
-        } else {
-          // For future days, use interval
-          existingQuery = await pool.query(
-            `SELECT id FROM doses 
-             WHERE reminder_id = $1 
-               AND patient_id = $2 
-               AND scheduled_time::date = CURRENT_DATE + $3::interval`,
-            [reminderId, patientId, `${i} days`]
-          );
-        }
+        const scheduledDate = new Date();
+        scheduledDate.setDate(scheduledDate.getDate() + i);
+        scheduledDate.setHours(hours, minutes, 0, 0);
 
-        if (existingQuery.rows.length === 0) {
-          // Insert the dose
-          let insertQuery;
-          if (i === 0) {
-            // For today, use CURRENT_DATE directly
-            insertQuery = await pool.query(
-              `INSERT INTO doses (reminder_id, medication_id, patient_id, scheduled_time, status)
-               VALUES ($1, $2, $3, 
-                 CURRENT_DATE::timestamp + $4::time,
-                 'pending'
-               )
-               RETURNING id, scheduled_time, status`,
-              [reminderId, medicationId, patientId, timeStr]
-            );
-          } else {
-            // For future days, add interval
-            insertQuery = await pool.query(
-              `INSERT INTO doses (reminder_id, medication_id, patient_id, scheduled_time, status)
-               VALUES ($1, $2, $3, 
-                 (CURRENT_DATE + $4::interval)::timestamp + $5::time,
-                 'pending'
-               )
-               RETURNING id, scheduled_time, status`,
-              [reminderId, medicationId, patientId, `${i} days`, timeStr]
-            );
+        // Check if dose already exists
+        const existingDose = await Dose.findOne({
+          reminder_id: reminderId,
+          patient_id: patientId,
+          scheduled_time: {
+            $gte: new Date(scheduledDate.getFullYear(), scheduledDate.getMonth(), scheduledDate.getDate()),
+            $lt: new Date(scheduledDate.getFullYear(), scheduledDate.getMonth(), scheduledDate.getDate() + 1)
           }
-          
-          const result = insertQuery;
+        });
+
+        if (!existingDose) {
+          const dose = await Dose.create({
+            reminder_id: reminderId,
+            medication_id: medicationId,
+            patient_id: patientId,
+            scheduled_time: scheduledDate,
+            status: 'pending'
+          });
+
           if (i === 0) {
-            console.log(`✅ Created dose for TODAY: ${result.rows[0].scheduled_time}, Status: ${result.rows[0].status}`);
-            // Verify it will show up in today's query
-            const verifyQuery = await pool.query(
-              `SELECT id FROM doses 
-               WHERE id = $1 
-                 AND scheduled_time::date = CURRENT_DATE`,
-              [result.rows[0].id]
-            );
-            if (verifyQuery.rows.length > 0) {
-              console.log(`✅ Verified: Dose will appear in today's schedule`);
-            } else {
-              console.log(`⚠️ Warning: Dose created but may not match CURRENT_DATE filter`);
-            }
+            console.log(`✅ Created dose for TODAY: ${dose.scheduled_time}, Status: ${dose.status}`);
           } else {
-            console.log(`Created dose for day ${i}: ${result.rows[0].scheduled_time}`);
+            console.log(`Created dose for day ${i}: ${dose.scheduled_time}`);
           }
         } else {
           if (i === 0) {
@@ -185,14 +144,11 @@ async function scheduleDoses(patientId, medicationId, reminderId, reminder) {
         }
       } catch (err) {
         console.error(`❌ Error inserting dose for day ${i}:`, err);
-        console.error(`Error details:`, err.message);
-        console.error(`Error stack:`, err.stack);
       }
     }
     console.log(`✅ Finished scheduling doses for reminder ${reminderId}`);
   } catch (error) {
     console.error('❌ Schedule doses error:', error);
-    console.error('Error stack:', error.stack);
   }
 }
 
@@ -202,29 +158,48 @@ router.get('/patient/:patientId/today', authenticateToken, async (req, res) => {
     const { patientId } = req.params;
 
     // Verify ownership
-    const checkResult = await pool.query(
-      'SELECT id FROM patients WHERE id = $1 AND caregiver_id = $2',
-      [patientId, req.user.id]
-    );
+    const patient = await Patient.findOne({
+      _id: patientId,
+      caregiver_id: req.user.id
+    });
 
-    if (checkResult.rows.length === 0) {
+    if (!patient) {
       return res.status(404).json({ error: 'Patient not found' });
     }
 
-    const result = await pool.query(
-      `SELECT d.*, m.name as medication_name, m.strength, m.dose_per_intake,
-              r.time_slot, r.food_rule
-       FROM doses d
-       JOIN medications m ON d.medication_id = m.id
-       JOIN reminders r ON d.reminder_id = r.id
-       WHERE d.patient_id = $1 
-         AND d.scheduled_time::date = CURRENT_DATE
-         AND d.status != 'cancelled'
-       ORDER BY d.scheduled_time`,
-      [patientId]
-    );
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    const tomorrow = new Date(today);
+    tomorrow.setDate(tomorrow.getDate() + 1);
 
-    res.json({ doses: result.rows });
+    const doses = await Dose.find({
+      patient_id: patientId,
+      scheduled_time: { $gte: today, $lt: tomorrow },
+      status: { $ne: 'cancelled' }
+    }).sort({ scheduled_time: 1 });
+
+    // Enrich with medication and reminder data
+    const enrichedDoses = await Promise.all(doses.map(async (dose) => {
+      const doseObj = dose.toObject();
+      doseObj.id = doseObj._id;
+
+      const medication = await Medication.findById(dose.medication_id);
+      const reminder = await Reminder.findById(dose.reminder_id);
+
+      if (medication) {
+        doseObj.medication_name = medication.name;
+        doseObj.strength = medication.strength;
+        doseObj.dose_per_intake = medication.dose_per_intake;
+      }
+      if (reminder) {
+        doseObj.time_slot = reminder.time_slot;
+        doseObj.food_rule = reminder.food_rule;
+      }
+
+      return doseObj;
+    }));
+
+    res.json({ doses: enrichedDoses });
   } catch (error) {
     console.error('Get today reminders error:', error);
     res.status(500).json({ error: 'Internal server error' });
@@ -238,30 +213,30 @@ router.post('/dose/:doseId/taken', authenticateToken, async (req, res) => {
     const { taken_by = 'manual' } = req.body;
 
     // Verify ownership
-    const doseResult = await pool.query(
-      `SELECT d.* FROM doses d
-       JOIN patients p ON d.patient_id = p.id
-       WHERE d.id = $1 AND p.caregiver_id = $2`,
-      [doseId, req.user.id]
-    );
-
-    if (doseResult.rows.length === 0) {
+    const dose = await Dose.findById(doseId);
+    if (!dose) {
       return res.status(404).json({ error: 'Dose not found' });
     }
 
-    const dose = doseResult.rows[0];
+    const patient = await Patient.findOne({
+      _id: dose.patient_id,
+      caregiver_id: req.user.id
+    });
+
+    if (!patient) {
+      return res.status(404).json({ error: 'Dose not found' });
+    }
+
     const delayMinutes = Math.floor((new Date() - new Date(dose.scheduled_time)) / 60000);
 
-    await pool.query(
-      `UPDATE doses 
-       SET status = 'taken',
-           taken_at = CURRENT_TIMESTAMP,
-           taken_by = $1,
-           delay_minutes = $2,
-           updated_at = CURRENT_TIMESTAMP
-       WHERE id = $3`,
-      [taken_by, delayMinutes, doseId]
-    );
+    await Dose.findByIdAndUpdate(doseId, {
+      $set: {
+        status: 'taken',
+        taken_at: new Date(),
+        taken_by: taken_by,
+        delay_minutes: delayMinutes
+      }
+    });
 
     // Update adherence log
     await updateAdherenceLog(dose.patient_id, dose.medication_id, dose.scheduled_time, 'taken');
@@ -284,38 +259,39 @@ router.post('/dose/:doseId/missed', authenticateToken, async (req, res) => {
     const { doseId } = req.params;
 
     // Verify ownership
-    const doseResult = await pool.query(
-      `SELECT d.* FROM doses d
-       JOIN patients p ON d.patient_id = p.id
-       WHERE d.id = $1 AND p.caregiver_id = $2`,
-      [doseId, req.user.id]
-    );
-
-    if (doseResult.rows.length === 0) {
+    const dose = await Dose.findById(doseId);
+    if (!dose) {
       return res.status(404).json({ error: 'Dose not found' });
     }
 
-    const dose = doseResult.rows[0];
+    const patient = await Patient.findOne({
+      _id: dose.patient_id,
+      caregiver_id: req.user.id
+    });
 
-    await pool.query(
-      `UPDATE doses 
-       SET status = 'missed',
-           missed_at = CURRENT_TIMESTAMP,
-           updated_at = CURRENT_TIMESTAMP
-       WHERE id = $1`,
-      [doseId]
-    );
+    if (!patient) {
+      return res.status(404).json({ error: 'Dose not found' });
+    }
+
+    await Dose.findByIdAndUpdate(doseId, {
+      $set: {
+        status: 'missed',
+        missed_at: new Date()
+      }
+    });
 
     // Update adherence log
     await updateAdherenceLog(dose.patient_id, dose.medication_id, dose.scheduled_time, 'missed');
 
     // Create alert
-    await pool.query(
-      `INSERT INTO alerts (caregiver_id, patient_id, alert_type, title, message, severity)
-       VALUES ($1, $2, 'missed_dose', 'Missed Dose', 
-               'Patient missed ${dose.medication_id} dose at scheduled time', 'high')`,
-      [req.user.id, dose.patient_id]
-    );
+    await Alert.create({
+      caregiver_id: req.user.id,
+      patient_id: dose.patient_id,
+      alert_type: 'missed_dose',
+      title: 'Missed Dose',
+      message: `Patient missed medication dose at scheduled time`,
+      severity: 'high'
+    });
 
     res.json({ message: 'Dose marked as missed' });
   } catch (error) {
@@ -327,22 +303,43 @@ router.post('/dose/:doseId/missed', authenticateToken, async (req, res) => {
 // Helper: Update adherence log
 async function updateAdherenceLog(patientId, medicationId, scheduledTime, status) {
   try {
-    const date = scheduledTime.toISOString().split('T')[0];
-    
-    await pool.query(
-      `INSERT INTO adherence_logs (patient_id, medication_id, date, total_doses, taken_doses, missed_doses)
-       VALUES ($1, $2, $3, 1, 
-               CASE WHEN $4 = 'taken' THEN 1 ELSE 0 END,
-               CASE WHEN $4 = 'missed' THEN 1 ELSE 0 END)
-       ON CONFLICT (patient_id, medication_id, date)
-       DO UPDATE SET
-         total_doses = adherence_logs.total_doses + 1,
-         taken_doses = adherence_logs.taken_doses + CASE WHEN $4 = 'taken' THEN 1 ELSE 0 END,
-         missed_doses = adherence_logs.missed_doses + CASE WHEN $4 = 'missed' THEN 1 ELSE 0 END,
-         adherence_percentage = (adherence_logs.taken_doses::DECIMAL / NULLIF(adherence_logs.total_doses, 0) * 100),
-         updated_at = CURRENT_TIMESTAMP`,
-      [patientId, medicationId, date, status]
-    );
+    const date = new Date(scheduledTime);
+    date.setHours(0, 0, 0, 0);
+
+    const existingLog = await AdherenceLog.findOne({
+      patient_id: patientId,
+      medication_id: medicationId,
+      date: date
+    });
+
+    if (existingLog) {
+      const updateData = {
+        $inc: {
+          total_doses: 1,
+          taken_doses: status === 'taken' ? 1 : 0,
+          missed_doses: status === 'missed' ? 1 : 0
+        }
+      };
+
+      await AdherenceLog.findByIdAndUpdate(existingLog._id, updateData);
+
+      // Update adherence percentage
+      const updatedLog = await AdherenceLog.findById(existingLog._id);
+      if (updatedLog.total_doses > 0) {
+        updatedLog.adherence_percentage = (updatedLog.taken_doses / updatedLog.total_doses) * 100;
+        await updatedLog.save();
+      }
+    } else {
+      await AdherenceLog.create({
+        patient_id: patientId,
+        medication_id: medicationId,
+        date: date,
+        total_doses: 1,
+        taken_doses: status === 'taken' ? 1 : 0,
+        missed_doses: status === 'missed' ? 1 : 0,
+        adherence_percentage: status === 'taken' ? 100 : 0
+      });
+    }
   } catch (error) {
     console.error('Update adherence log error:', error);
   }
@@ -351,19 +348,21 @@ async function updateAdherenceLog(patientId, medicationId, scheduledTime, status
 // Helper: Shift future doses if delay > 15 minutes
 async function shiftFutureDoses(reminderId, delayMinutes) {
   try {
-    await pool.query(
-      `UPDATE doses 
-       SET scheduled_time = scheduled_time + INTERVAL '${delayMinutes} minutes',
-           updated_at = CURRENT_TIMESTAMP
-       WHERE reminder_id = $1 
-         AND status = 'pending'
-         AND scheduled_time > CURRENT_TIMESTAMP`,
-      [reminderId]
-    );
+    const pendingDoses = await Dose.find({
+      reminder_id: reminderId,
+      status: 'pending',
+      scheduled_time: { $gt: new Date() }
+    });
+
+    for (const dose of pendingDoses) {
+      const newTime = new Date(dose.scheduled_time.getTime() + delayMinutes * 60000);
+      await Dose.findByIdAndUpdate(dose._id, {
+        $set: { scheduled_time: newTime }
+      });
+    }
   } catch (error) {
     console.error('Shift future doses error:', error);
   }
 }
 
 module.exports = router;
-

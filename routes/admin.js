@@ -1,5 +1,5 @@
 const express = require('express');
-const pool = require('../config/database');
+const { Caregiver, Patient, Medication, Alert } = require('../models');
 const { authenticateToken } = require('../middleware/auth');
 const { isAdmin } = require('../middleware/admin');
 
@@ -26,28 +26,24 @@ const maskPhone = (phone) => {
 // Get all caregivers (with privacy masking)
 router.get('/caregivers', async (req, res) => {
   try {
-    const result = await pool.query(`
-      SELECT 
-        id,
-        name,
-        email,
-        phone,
-        created_at,
-        updated_at
-      FROM caregivers
-      ORDER BY created_at DESC
-    `);
+    const caregivers = await Caregiver.find()
+      .select('name email phone created_at updated_at')
+      .sort({ created_at: -1 });
 
     // Mask sensitive data for privacy
-    const caregivers = result.rows.map(c => ({
-      ...c,
-      email: maskEmail(c.email),
-      phone: maskPhone(c.phone),
-    }));
+    const maskedCaregivers = caregivers.map(c => {
+      const obj = c.toObject();
+      obj.id = obj._id;
+      return {
+        ...obj,
+        email: maskEmail(obj.email),
+        phone: maskPhone(obj.phone),
+      };
+    });
 
     res.json({ 
-      total: caregivers.length,
-      caregivers 
+      total: maskedCaregivers.length,
+      caregivers: maskedCaregivers 
     });
   } catch (error) {
     console.error('Get caregivers error:', error);
@@ -58,30 +54,25 @@ router.get('/caregivers', async (req, res) => {
 // Get all patients (with privacy masking)
 router.get('/patients', async (req, res) => {
   try {
-    const result = await pool.query(`
-      SELECT 
-        p.id,
-        p.name,
-        p.age,
-        p.gender,
-        p.relationship,
-        p.created_at,
-        c.name as caregiver_name,
-        c.email as caregiver_email
-      FROM patients p
-      JOIN caregivers c ON p.caregiver_id = c.id
-      ORDER BY p.created_at DESC
-    `);
+    const patients = await Patient.find()
+      .select('name age gender relationship created_at caregiver_id')
+      .sort({ created_at: -1 });
 
-    // Mask sensitive data
-    const patients = result.rows.map(p => ({
-      ...p,
-      caregiver_email: maskEmail(p.caregiver_email),
+    // Enrich with caregiver data
+    const enrichedPatients = await Promise.all(patients.map(async (p) => {
+      const pObj = p.toObject();
+      pObj.id = pObj._id;
+
+      const caregiver = await Caregiver.findById(p.caregiver_id).select('name email');
+      pObj.caregiver_name = caregiver ? caregiver.name : 'Unknown';
+      pObj.caregiver_email = caregiver ? maskEmail(caregiver.email) : '';
+
+      return pObj;
     }));
 
     res.json({ 
-      total: patients.length,
-      patients 
+      total: enrichedPatients.length,
+      patients: enrichedPatients 
     });
   } catch (error) {
     console.error('Get patients error:', error);
@@ -92,26 +83,31 @@ router.get('/patients', async (req, res) => {
 // Get all medications
 router.get('/medications', async (req, res) => {
   try {
-    const result = await pool.query(`
-      SELECT 
-        m.id,
-        m.name,
-        m.strength,
-        m.dose_per_intake,
-        m.frequency,
-        m.is_active,
-        m.created_at,
-        p.name as patient_name,
-        c.name as caregiver_name
-      FROM medications m
-      JOIN patients p ON m.patient_id = p.id
-      JOIN caregivers c ON p.caregiver_id = c.id
-      ORDER BY m.created_at DESC
-    `);
+    const medications = await Medication.find()
+      .select('name strength dose_per_intake frequency is_active created_at patient_id')
+      .sort({ created_at: -1 });
+
+    // Enrich with patient and caregiver data
+    const enrichedMeds = await Promise.all(medications.map(async (m) => {
+      const mObj = m.toObject();
+      mObj.id = mObj._id;
+
+      const patient = await Patient.findById(m.patient_id).select('name caregiver_id');
+      mObj.patient_name = patient ? patient.name : 'Unknown';
+
+      if (patient) {
+        const caregiver = await Caregiver.findById(patient.caregiver_id).select('name');
+        mObj.caregiver_name = caregiver ? caregiver.name : 'Unknown';
+      } else {
+        mObj.caregiver_name = 'Unknown';
+      }
+
+      return mObj;
+    }));
 
     res.json({ 
-      total: result.rows.length,
-      medications: result.rows 
+      total: enrichedMeds.length,
+      medications: enrichedMeds 
     });
   } catch (error) {
     console.error('Get medications error:', error);
@@ -122,27 +118,28 @@ router.get('/medications', async (req, res) => {
 // Get all alerts
 router.get('/alerts', async (req, res) => {
   try {
-    const result = await pool.query(`
-      SELECT 
-        a.id,
-        a.alert_type,
-        a.title,
-        a.message,
-        a.severity,
-        a.is_read,
-        a.created_at,
-        p.name as patient_name,
-        c.name as caregiver_name
-      FROM alerts a
-      JOIN patients p ON a.patient_id = p.id
-      JOIN caregivers c ON p.caregiver_id = c.id
-      ORDER BY a.created_at DESC
-      LIMIT 100
-    `);
+    const alerts = await Alert.find()
+      .select('alert_type title message severity is_read created_at patient_id caregiver_id')
+      .sort({ created_at: -1 })
+      .limit(100);
+
+    // Enrich with patient and caregiver data
+    const enrichedAlerts = await Promise.all(alerts.map(async (a) => {
+      const aObj = a.toObject();
+      aObj.id = aObj._id;
+
+      const patient = await Patient.findById(a.patient_id).select('name');
+      aObj.patient_name = patient ? patient.name : 'Unknown';
+
+      const caregiver = await Caregiver.findById(a.caregiver_id).select('name');
+      aObj.caregiver_name = caregiver ? caregiver.name : 'Unknown';
+
+      return aObj;
+    }));
 
     res.json({ 
-      total: result.rows.length,
-      alerts: result.rows 
+      total: enrichedAlerts.length,
+      alerts: enrichedAlerts 
     });
   } catch (error) {
     console.error('Get alerts error:', error);
@@ -154,23 +151,22 @@ router.get('/alerts', async (req, res) => {
 router.get('/login-activity', async (req, res) => {
   try {
     // Get recent registrations (as proxy for login activity)
-    const result = await pool.query(`
-      SELECT 
-        id,
-        name,
-        email,
-        created_at as last_activity,
-        'registration' as activity_type
-      FROM caregivers
-      ORDER BY created_at DESC
-      LIMIT 50
-    `);
+    const caregivers = await Caregiver.find()
+      .select('name email created_at')
+      .sort({ created_at: -1 })
+      .limit(50);
 
     // Mask sensitive data
-    const activity = result.rows.map(a => ({
-      ...a,
-      email: maskEmail(a.email),
-    }));
+    const activity = caregivers.map(c => {
+      const obj = c.toObject();
+      obj.id = obj._id;
+      return {
+        ...obj,
+        email: maskEmail(obj.email),
+        last_activity: obj.created_at,
+        activity_type: 'registration'
+      };
+    });
 
     res.json({ 
       total: activity.length,
@@ -185,19 +181,19 @@ router.get('/login-activity', async (req, res) => {
 // Get dashboard statistics
 router.get('/stats', async (req, res) => {
   try {
-    const [caregivers, patients, medications, alerts] = await Promise.all([
-      pool.query('SELECT COUNT(*) as count FROM caregivers'),
-      pool.query('SELECT COUNT(*) as count FROM patients'),
-      pool.query('SELECT COUNT(*) as count FROM medications WHERE is_active = true'),
-      pool.query('SELECT COUNT(*) as count FROM alerts WHERE is_read = false'),
+    const [totalCaregivers, totalPatients, activeMedications, unreadAlerts] = await Promise.all([
+      Caregiver.countDocuments(),
+      Patient.countDocuments(),
+      Medication.countDocuments({ is_active: true }),
+      Alert.countDocuments({ is_read: false }),
     ]);
 
     res.json({
       stats: {
-        totalCaregivers: parseInt(caregivers.rows[0].count),
-        totalPatients: parseInt(patients.rows[0].count),
-        activeMedications: parseInt(medications.rows[0].count),
-        unreadAlerts: parseInt(alerts.rows[0].count),
+        totalCaregivers,
+        totalPatients,
+        activeMedications,
+        unreadAlerts,
       }
     });
   } catch (error) {
@@ -207,4 +203,3 @@ router.get('/stats', async (req, res) => {
 });
 
 module.exports = router;
-

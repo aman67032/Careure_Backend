@@ -1,5 +1,5 @@
 const express = require('express');
-const pool = require('../config/database');
+const { Medication, Patient, Reminder } = require('../models');
 const { authenticateToken } = require('../middleware/auth');
 const { validateMedication } = require('../middleware/validate');
 
@@ -11,28 +11,37 @@ router.get('/patient/:patientId', authenticateToken, async (req, res) => {
     const { patientId } = req.params;
 
     // Verify patient belongs to caregiver
-    const patientCheck = await pool.query(
-      'SELECT id FROM patients WHERE id = $1 AND caregiver_id = $2',
-      [patientId, req.user.id]
-    );
+    const patient = await Patient.findOne({
+      _id: patientId,
+      caregiver_id: req.user.id
+    });
 
-    if (patientCheck.rows.length === 0) {
+    if (!patient) {
       return res.status(404).json({ error: 'Patient not found' });
     }
 
-    const result = await pool.query(
-      `SELECT m.*, 
-              COUNT(r.id) as reminder_count,
-              STRING_AGG(DISTINCT r.time_slot, ', ') as time_slots
-       FROM medications m
-       LEFT JOIN reminders r ON m.id = r.medication_id AND r.is_active = true
-       WHERE m.patient_id = $1 AND m.is_active = true
-       GROUP BY m.id
-       ORDER BY m.created_at DESC`,
-      [patientId]
-    );
+    const medications = await Medication.find({
+      patient_id: patientId,
+      is_active: true
+    }).sort({ created_at: -1 });
 
-    res.json({ medications: result.rows });
+    // Enrich with reminder data
+    const enrichedMeds = await Promise.all(medications.map(async (med) => {
+      const medObj = med.toObject();
+      medObj.id = medObj._id;
+
+      const reminders = await Reminder.find({
+        medication_id: med._id,
+        is_active: true
+      });
+
+      medObj.reminder_count = reminders.length;
+      medObj.time_slots = [...new Set(reminders.map(r => r.time_slot))].join(', ');
+
+      return medObj;
+    }));
+
+    res.json({ medications: enrichedMeds });
   } catch (error) {
     console.error('Get medications error:', error);
     res.status(500).json({ error: 'Internal server error' });
@@ -44,30 +53,33 @@ router.get('/:id', authenticateToken, async (req, res) => {
   try {
     const { id } = req.params;
 
-    const medResult = await pool.query(
-      `SELECT m.*, p.caregiver_id 
-       FROM medications m
-       JOIN patients p ON m.patient_id = p.id
-       WHERE m.id = $1`,
-      [id]
-    );
+    const medication = await Medication.findById(id);
 
-    if (medResult.rows.length === 0) {
+    if (!medication) {
       return res.status(404).json({ error: 'Medication not found' });
     }
 
-    if (medResult.rows[0].caregiver_id !== req.user.id) {
+    // Verify ownership through patient
+    const patient = await Patient.findOne({
+      _id: medication.patient_id,
+      caregiver_id: req.user.id
+    });
+
+    if (!patient) {
       return res.status(403).json({ error: 'Unauthorized' });
     }
 
-    const reminders = await pool.query(
-      'SELECT * FROM reminders WHERE medication_id = $1 AND is_active = true ORDER BY exact_time',
-      [id]
-    );
+    const reminders = await Reminder.find({
+      medication_id: id,
+      is_active: true
+    }).sort({ exact_time: 1 });
+
+    const medObj = medication.toObject();
+    medObj.id = medObj._id;
 
     res.json({
-      medication: medResult.rows[0],
-      reminders: reminders.rows
+      medication: medObj,
+      reminders: reminders.map(r => { const obj = r.toObject(); obj.id = obj._id; return obj; })
     });
   } catch (error) {
     console.error('Get medication error:', error);
@@ -85,28 +97,32 @@ router.post('/patient/:patientId', authenticateToken, validateMedication, async 
     } = req.body;
 
     // Verify patient belongs to caregiver
-    const patientCheck = await pool.query(
-      'SELECT id FROM patients WHERE id = $1 AND caregiver_id = $2',
-      [patientId, req.user.id]
-    );
+    const patient = await Patient.findOne({
+      _id: patientId,
+      caregiver_id: req.user.id
+    });
 
-    if (patientCheck.rows.length === 0) {
+    if (!patient) {
       return res.status(404).json({ error: 'Patient not found' });
     }
 
-    const result = await pool.query(
-      `INSERT INTO medications (
-        patient_id, name, strength, dose_per_intake, frequency,
-        food_rule, duration_days, notes
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-      RETURNING *`,
-      [patientId, name, strength, dose_per_intake, frequency,
-       food_rule, duration_days, notes]
-    );
+    const medication = await Medication.create({
+      patient_id: patientId,
+      name,
+      strength,
+      dose_per_intake,
+      frequency,
+      food_rule,
+      duration_days,
+      notes
+    });
+
+    const medObj = medication.toObject();
+    medObj.id = medObj._id;
 
     res.status(201).json({
       message: 'Medication added successfully',
-      medication: result.rows[0]
+      medication: medObj
     });
   } catch (error) {
     console.error('Add medication error:', error);
@@ -121,12 +137,12 @@ router.post('/patient/:patientId/ocr', authenticateToken, async (req, res) => {
     const { medicines } = req.body; // Array of extracted medicines
 
     // Verify patient belongs to caregiver
-    const patientCheck = await pool.query(
-      'SELECT id FROM patients WHERE id = $1 AND caregiver_id = $2',
-      [patientId, req.user.id]
-    );
+    const patient = await Patient.findOne({
+      _id: patientId,
+      caregiver_id: req.user.id
+    });
 
-    if (patientCheck.rows.length === 0) {
+    if (!patient) {
       return res.status(404).json({ error: 'Patient not found' });
     }
 
@@ -137,23 +153,19 @@ router.post('/patient/:patientId/ocr', authenticateToken, async (req, res) => {
     // Create medications from OCR results
     const createdMedications = [];
     for (const med of medicines) {
-      const result = await pool.query(
-        `INSERT INTO medications (
-          patient_id, name, strength, dose_per_intake, frequency,
-          food_rule, notes
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7)
-        RETURNING *`,
-        [
-          patientId,
-          med.name || 'Unknown Medicine',
-          med.strength || null,
-          med.dose_per_intake || '1',
-          med.frequency || 'once',
-          med.food_rule || null,
-          med.notes || 'Extracted from prescription'
-        ]
-      );
-      createdMedications.push(result.rows[0]);
+      const medication = await Medication.create({
+        patient_id: patientId,
+        name: med.name || 'Unknown Medicine',
+        strength: med.strength || null,
+        dose_per_intake: med.dose_per_intake || '1',
+        frequency: med.frequency || 'once',
+        food_rule: med.food_rule || null,
+        notes: med.notes || 'Extracted from prescription'
+      });
+
+      const medObj = medication.toObject();
+      medObj.id = medObj._id;
+      createdMedications.push(medObj);
     }
 
     res.status(201).json({
@@ -176,35 +188,41 @@ router.put('/:id', authenticateToken, async (req, res) => {
     } = req.body;
 
     // Verify ownership
-    const checkResult = await pool.query(
-      `SELECT m.id FROM medications m
-       JOIN patients p ON m.patient_id = p.id
-       WHERE m.id = $1 AND p.caregiver_id = $2`,
-      [id, req.user.id]
-    );
-
-    if (checkResult.rows.length === 0) {
+    const medication = await Medication.findById(id);
+    if (!medication) {
       return res.status(404).json({ error: 'Medication not found' });
     }
 
-    const result = await pool.query(
-      `UPDATE medications 
-       SET name = COALESCE($1, name),
-           strength = COALESCE($2, strength),
-           dose_per_intake = COALESCE($3, dose_per_intake),
-           frequency = COALESCE($4, frequency),
-           food_rule = COALESCE($5, food_rule),
-           duration_days = COALESCE($6, duration_days),
-           notes = COALESCE($7, notes),
-           updated_at = CURRENT_TIMESTAMP
-       WHERE id = $8
-       RETURNING *`,
-      [name, strength, dose_per_intake, frequency, food_rule, duration_days, notes, id]
+    const patient = await Patient.findOne({
+      _id: medication.patient_id,
+      caregiver_id: req.user.id
+    });
+
+    if (!patient) {
+      return res.status(404).json({ error: 'Medication not found' });
+    }
+
+    const updateData = {};
+    if (name !== undefined) updateData.name = name;
+    if (strength !== undefined) updateData.strength = strength;
+    if (dose_per_intake !== undefined) updateData.dose_per_intake = dose_per_intake;
+    if (frequency !== undefined) updateData.frequency = frequency;
+    if (food_rule !== undefined) updateData.food_rule = food_rule;
+    if (duration_days !== undefined) updateData.duration_days = duration_days;
+    if (notes !== undefined) updateData.notes = notes;
+
+    const updatedMed = await Medication.findByIdAndUpdate(
+      id,
+      { $set: updateData },
+      { new: true }
     );
+
+    const medObj = updatedMed.toObject();
+    medObj.id = medObj._id;
 
     res.json({
       message: 'Medication updated successfully',
-      medication: result.rows[0]
+      medication: medObj
     });
   } catch (error) {
     console.error('Update medication error:', error);
@@ -218,21 +236,23 @@ router.delete('/:id', authenticateToken, async (req, res) => {
     const { id } = req.params;
 
     // Verify ownership
-    const checkResult = await pool.query(
-      `SELECT m.id FROM medications m
-       JOIN patients p ON m.patient_id = p.id
-       WHERE m.id = $1 AND p.caregiver_id = $2`,
-      [id, req.user.id]
-    );
-
-    if (checkResult.rows.length === 0) {
+    const medication = await Medication.findById(id);
+    if (!medication) {
       return res.status(404).json({ error: 'Medication not found' });
     }
 
-    await pool.query(
-      'UPDATE medications SET is_active = false, updated_at = CURRENT_TIMESTAMP WHERE id = $1',
-      [id]
-    );
+    const patient = await Patient.findOne({
+      _id: medication.patient_id,
+      caregiver_id: req.user.id
+    });
+
+    if (!patient) {
+      return res.status(404).json({ error: 'Medication not found' });
+    }
+
+    await Medication.findByIdAndUpdate(id, {
+      $set: { is_active: false }
+    });
 
     res.json({ message: 'Medication deleted successfully' });
   } catch (error) {
@@ -242,4 +262,3 @@ router.delete('/:id', authenticateToken, async (req, res) => {
 });
 
 module.exports = router;
-
